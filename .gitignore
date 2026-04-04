@@ -31,3 +31,51 @@ logs/
 # Backup files
 *.bak
 *.old
+
+# Sensitive files
+.env
+*.pem
+*.key
+*.crt
+*.sql
+*.sql.gz
+
+# Test files
+test_*.txt
+secret.txt
+received_secret.txt
+storage_test.txt
+test_bytes.txt
+test_large.txt
+
+# Backup files
+crontab_backup.txt
+*.backup
+*.bak
+
+# Binary files
+*.tar.gz
+*.zip
+*.exe
+*.msi
+
+# Node exporter (external tool)
+node_exporter-*/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+/var/log/
+
+# Storage (if accidentally committed)
+storage/
+uploads/
