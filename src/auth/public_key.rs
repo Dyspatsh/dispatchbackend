@@ -19,13 +19,13 @@ pub async fn upload_public_key(
     Extension(user_id): Extension<Uuid>,
     AxumJson(payload): AxumJson<UploadPublicKeyRequest>,
 ) -> (StatusCode, Json<UploadPublicKeyResponse>) {
-    // Validate public key format (basic check)
-    if payload.public_key.is_empty() || !payload.public_key.contains("BEGIN PUBLIC KEY") {
+    // Accept any non-empty public key (will accept real XML)
+    if payload.public_key.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
             Json(UploadPublicKeyResponse {
                 success: false,
-                message: "Invalid public key format".to_string(),
+                message: "Public key cannot be empty".to_string(),
             }),
         );
     }

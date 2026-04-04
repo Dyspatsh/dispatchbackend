@@ -122,16 +122,16 @@ pub async fn upload_file(
     }
     
     // Validate encrypted_session_key is not a temp placeholder
-    if payload.encrypted_session_key.starts_with("temp_key_") || payload.encrypted_session_key.len() < 10 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(UploadResponse {
-                success: false,
-                message: "Invalid session key format".to_string(),
-                file_id: None,
-            }),
-        );
-    }
+if payload.encrypted_session_key.is_empty() {
+    return (
+        StatusCode::BAD_REQUEST,
+        Json(UploadResponse {
+            success: false,
+            message: "Session key cannot be empty".to_string(),
+            file_id: None,
+        }),
+    );
+}
     
     let file_id = Uuid::new_v4();
     let file_path = format!("{}/{}.bin", STORAGE_PATH, file_id);
