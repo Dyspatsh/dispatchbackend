@@ -30,25 +30,35 @@ struct Claims {
     role: String,
 }
 
-fn sanitize_input(input: &str) -> String {
-    input.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
-}
-
 pub async fn login(
     Extension(pool): Extension<PgPool>,
     AxumJson(payload): AxumJson<LoginRequest>,
 ) -> (StatusCode, Json<LoginResponse>) {
-    let username = sanitize_input(&payload.username);
-    
+    // Query includes password_hash and pin_hash
     let user = sqlx::query!(
-        "SELECT id, password_hash, pin_hash, role FROM users WHERE username = $1",
-        username
+        "SELECT id, password_hash, pin_hash, role, is_banned FROM users WHERE username = $1",
+        payload.username
     )
     .fetch_optional(&pool)
     .await;
     
     let user = match user {
-        Ok(Some(u)) => u,
+        Ok(Some(u)) => {
+            // Check if user is banned
+            if u.is_banned.unwrap_or(false) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(LoginResponse {
+                        success: false,
+                        message: "Account is banned".to_string(),
+                        token: None,
+                        user_id: None,
+                        role: None,
+                    }),
+                );
+            }
+            u
+        },
         _ => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -63,10 +73,13 @@ pub async fn login(
         }
     };
     
-    // Verify password
-    let password_valid = match verify(&payload.password, &user.password_hash.unwrap_or_default()) {
-        Ok(v) => v,
-        Err(_) => false,
+    // Verify password - handle Option<String>
+    let password_valid = match user.password_hash {
+        Some(hash) => match verify(&payload.password, &hash) {
+            Ok(v) => v,
+            Err(_) => false,
+        },
+        None => false,
     };
     
     if !password_valid {
@@ -82,10 +95,13 @@ pub async fn login(
         );
     }
     
-    // Verify PIN
-    let pin_valid = match verify(&payload.pin, &user.pin_hash.unwrap_or_default()) {
-        Ok(v) => v,
-        Err(_) => false,
+    // Verify PIN - handle Option<String>
+    let pin_valid = match user.pin_hash {
+        Some(hash) => match verify(&payload.pin, &hash) {
+            Ok(v) => v,
+            Err(_) => false,
+        },
+        None => false,
     };
     
     if !pin_valid {
@@ -128,6 +144,14 @@ pub async fn login(
             );
         }
     };
+    
+    // Update last_seen
+    let _ = sqlx::query!(
+        "UPDATE users SET last_seen = NOW() WHERE id = $1",
+        user.id
+    )
+    .execute(&pool)
+    .await;
     
     (
         StatusCode::OK,

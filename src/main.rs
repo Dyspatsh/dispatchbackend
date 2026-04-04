@@ -1,8 +1,9 @@
 use axum::{
     Router, routing::{get, post}, response::Json, extract::Extension,
-    middleware, http::Method,  // Removed HeaderValue since it's unused
+    middleware, http::Method,
 };
 use tower_http::cors::{CorsLayer, Any};
+use tower_http::limit::RequestBodyLimitLayer;
 use serde_json::json;
 use tokio::net::TcpListener;
 use dotenv::dotenv;
@@ -16,10 +17,9 @@ mod handlers;
 use auth::register::register;
 use auth::login::login;
 use auth::recovery::recover_account;
-use auth::public_key::upload_public_key;  // ADD THIS IMPORT
+use auth::public_key::upload_public_key;
 use handlers::*;
 
-// FIXED: Proper JWT claims with expiration validation
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Claims {
     sub: String,
@@ -34,32 +34,31 @@ async fn auth_middleware(
     let auth_header = req.headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok());
-    
+
     let user_id = if let Some(header) = auth_header {
         if header.starts_with("Bearer ") {
             let token = &header[7..];
             use jsonwebtoken::{decode, DecodingKey, Validation};
-            
+
             let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
-            
-            // FIXED: Proper validation with expiration check
+
             let mut validation = Validation::default();
             validation.validate_exp = true;
             validation.leeway = 0;
-            
+
             let decoded = decode::<Claims>(
                 token,
                 &DecodingKey::from_secret(jwt_secret.as_bytes()),
                 &validation,
             );
-            
+
             match decoded {
                 Ok(data) => {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
                         .as_secs() as usize;
-                    
+
                     if data.claims.exp < now {
                         None
                     } else {
@@ -70,7 +69,7 @@ async fn auth_middleware(
             }.flatten()
         } else { None }
     } else { None };
-    
+
     if let Some(uid) = user_id {
         req.extensions_mut().insert(uid);
         Ok(next.run(req).await)
@@ -85,23 +84,27 @@ async fn auth_middleware(
 async fn main() {
     dotenv().ok();
     tracing_subscriber::fmt::init();
-    
+
     let database_url = env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&database_url)
         .await
         .expect("Failed to connect to database");
-    
+
     let port = env::var("SERVER_PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
-    
+
     // CORS configuration
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+	.allow_origin("https://localhost".parse::<axum::http::HeaderValue>().unwrap())
+	.allow_origin("https://your-server-ip".parse::<axum::http::HeaderValue>().unwrap())
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(Any);
-    
+
+    // Request size limit (10MB for uploads)
+    let request_limit = RequestBodyLimitLayer::new(10 * 1024 * 1024); // 10MB limit
+
     // Public routes (no auth required)
     let public_routes = Router::new()
         .route("/", get(health_check))
@@ -113,7 +116,7 @@ async fn main() {
         .route("/users/status/:username", get(check_user_status))
         .route("/users/public-key/:username", get(get_public_key_by_username))
         .route("/users/search", get(search_users));
-    
+
     // Protected routes (auth required)
     let protected_routes = Router::new()
         .route("/users/block/:username", post(block_user))
@@ -121,7 +124,7 @@ async fn main() {
         .route("/users/blocked", get(get_blocked_users))
         .route("/users/is-blocked-by/:username", get(is_blocked_by))
         .route("/users/public-key/upload", post(upload_public_key))
-        .route("/files/upload", post(upload_file))
+        .route("/files/upload", post(upload_file).layer(request_limit))
         .route("/files/pending", get(list_pending_files))
         .route("/files/sent", get(list_sent_files))
         .route("/files/received", get(list_received_files))
@@ -130,14 +133,15 @@ async fn main() {
         .route("/files/cancel/:file_id", post(cancel_file))
         .route("/files/download/:file_id", get(download_file))
         .layer(middleware::from_fn(auth_middleware));
-    
+
     let app = public_routes
         .merge(protected_routes)
         .layer(cors)
         .layer(Extension(pool));
-    
+
     println!("Dispatch server running on http://{}", addr);
-    
+    println!("File upload limit: 10MB per request");
+
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
