@@ -4,18 +4,30 @@
 # Compiled files
 target/
 *.rs.bk
+*.pdb
 
 # Database files
 *.db
 *.sqlite
 
 # Storage files (user uploads)
-/opt/dispatch/storage/files/*.bin
+/opt/dispatch/storage/
+storage/
 
 # IDE files
 .vscode/
 .idea/
+*.swp
+*.swo
 
 # OS files
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Backup files
+*.bak
+*.old
