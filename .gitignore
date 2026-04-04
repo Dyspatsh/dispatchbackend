@@ -1,20 +1,16 @@
-# Rust build artifacts
-target/
-**/*.rs.bk
-
-# Environment files
+# Environment variables (contains passwords!)
 .env
-.env.local
+
+# Compiled files
+target/
+*.rs.bk
 
 # Database files
 *.db
 *.sqlite
 
-# Storage files (user uploaded files)
+# Storage files (user uploads)
 /opt/dispatch/storage/files/*.bin
-
-# Logs
-*.log
 
 # IDE files
 .vscode/
