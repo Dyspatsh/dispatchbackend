@@ -26,50 +26,46 @@ pub async fn recover_account(
     Extension(pool): Extension<PgPool>,
     AxumJson(payload): AxumJson<RecoveryRequest>,
 ) -> (StatusCode, Json<RecoveryResponse>) {
-    // First, find the user by recovery phrase
-    let users = sqlx::query!(
+    // Query users with their recovery phrase hash
+    let result = sqlx::query!(
         "SELECT id, recovery_phrase_hash FROM users WHERE recovery_phrase_hash IS NOT NULL"
     )
     .fetch_all(&pool)
     .await;
     
-    let users = match users {
+    let users = match result {
         Ok(u) => u,
         Err(e) => {
-            eprintln!("Recovery error - DB query: {}", e);
+            eprintln!("Recovery error: {}", e);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(RecoveryResponse {
                     success: false,
-                    message: "Recovery failed. Please try again.".to_string(),
+                    message: "Recovery failed".to_string(),
                 }),
             );
         }
     };
     
-    // Find matching recovery phrase
+    // Find user by verifying hash
     let mut user_id: Option<Uuid> = None;
     for user in users {
-        // Get the hash value, skip if None
-        let hash_value = match user.recovery_phrase_hash {
-            Some(h) => h,
-            None => continue,
-        };
-        
-        match verify(&payload.recovery_phrase, &hash_value) {
-            Ok(true) => {
-                user_id = Some(user.id);
-                break;
-            }
-            Ok(false) => continue,
-            Err(e) => {
-                eprintln!("Recovery error - verify: {}", e);
-                continue;
+        // FIXED: recovery_phrase_hash is Option<String>
+        if let Some(hash) = user.recovery_phrase_hash.as_ref() {
+            match verify(&payload.recovery_phrase, hash) {
+                Ok(true) => {
+                    user_id = Some(user.id);
+                    break;
+                }
+                Ok(false) => continue,
+                Err(e) => {
+                    eprintln!("Verify error: {}", e);
+                    continue;
+                }
             }
         }
     }
     
-    // If no user found with this recovery phrase, return error
     let user_id = match user_id {
         Some(id) => id,
         None => {
@@ -77,13 +73,12 @@ pub async fn recover_account(
                 StatusCode::NOT_FOUND,
                 Json(RecoveryResponse {
                     success: false,
-                    message: "Invalid recovery phrase. No account found with this phrase.".to_string(),
+                    message: "Invalid recovery phrase".to_string(),
                 }),
             );
         }
     };
     
-    // At least one field must be provided to update
     let has_updates = payload.new_username.is_some() || 
                       payload.new_password.is_some() || 
                       payload.new_pin.is_some();
@@ -93,23 +88,29 @@ pub async fn recover_account(
             StatusCode::BAD_REQUEST,
             Json(RecoveryResponse {
                 success: false,
-                message: "No changes provided. Please specify what to update.".to_string(),
+                message: "No changes provided".to_string(),
             }),
         );
     }
+    
+    let mut update_success = true;
     
     // Update username if provided
     if let Some(new_username) = &payload.new_username {
         let sanitized = sanitize_input(new_username);
         if sanitized.len() >= 3 && sanitized.len() <= 16 && 
            sanitized.chars().all(|c| c.is_ascii_alphanumeric()) {
-            let _ = sqlx::query!(
+            let result = sqlx::query!(
                 "UPDATE users SET username = $1 WHERE id = $2",
                 sanitized,
                 user_id
             )
             .execute(&pool)
             .await;
+            
+            if result.is_err() {
+                update_success = false;
+            }
         }
     }
     
@@ -122,13 +123,17 @@ pub async fn recover_account(
             
             if has_letter && has_number && has_symbol {
                 if let Ok(password_hash) = hash(new_password, DEFAULT_COST) {
-                    let _ = sqlx::query!(
+                    let result = sqlx::query!(
                         "UPDATE users SET password_hash = $1 WHERE id = $2",
                         password_hash,
                         user_id
                     )
                     .execute(&pool)
                     .await;
+                    
+                    if result.is_err() {
+                        update_success = false;
+                    }
                 }
             }
         }
@@ -138,22 +143,36 @@ pub async fn recover_account(
     if let Some(new_pin) = &payload.new_pin {
         if new_pin.len() == 6 && new_pin.chars().all(|c| c.is_ascii_digit()) {
             if let Ok(pin_hash) = hash(new_pin, DEFAULT_COST) {
-                let _ = sqlx::query!(
+                let result = sqlx::query!(
                     "UPDATE users SET pin_hash = $1 WHERE id = $2",
                     pin_hash,
                     user_id
                 )
                 .execute(&pool)
                 .await;
+                
+                if result.is_err() {
+                    update_success = false;
+                }
             }
         }
     }
     
-    (
-        StatusCode::OK,
-        Json(RecoveryResponse {
-            success: true,
-            message: "Account recovered successfully. You can now log in with your new credentials.".to_string(),
-        }),
-    )
+    if update_success {
+        (
+            StatusCode::OK,
+            Json(RecoveryResponse {
+                success: true,
+                message: "Account recovered successfully".to_string(),
+            }),
+        )
+    } else {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(RecoveryResponse {
+                success: false,
+                message: "Partial update completed with errors".to_string(),
+            }),
+        )
+    }
 }

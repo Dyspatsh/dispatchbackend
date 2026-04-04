@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use tokio::fs;
 
 const STORAGE_PATH: &str = "/opt/dispatch/storage/files";
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB limit
 
 #[derive(Deserialize)]
 pub struct UploadRequest {
@@ -42,21 +43,47 @@ async fn is_blocked(pool: &PgPool, user_a_id: Uuid, user_b_id: Uuid) -> bool {
     result.unwrap_or(Some(false)).unwrap_or(false)
 }
 
+// ============ UPLOAD FILE ============
 pub async fn upload_file(
     Extension(pool): Extension<PgPool>,
     Extension(user_id): Extension<Uuid>,
     AxumJson(payload): AxumJson<UploadRequest>,
 ) -> (StatusCode, Json<UploadResponse>) {
+    // Validate file size before decoding
+    let decoded_size = (payload.encrypted_data.len() * 3) / 4;
+    if decoded_size > MAX_FILE_SIZE as usize {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(UploadResponse {
+                success: false,
+                message: format!("File too large. Maximum size is {} GB", MAX_FILE_SIZE / (1024*1024*1024)),
+                file_id: None,
+            }),
+        );
+    }
+    
     // Find recipient
     let recipient = sqlx::query!(
-        "SELECT id FROM users WHERE username = $1",
+        "SELECT id, is_banned FROM users WHERE username = $1",
         payload.recipient_username
     )
     .fetch_optional(&pool)
     .await;
     
-    let recipient_id = match recipient {
-        Ok(Some(r)) => r.id,
+    let recipient = match recipient {
+        Ok(Some(r)) => {
+            if r.is_banned.unwrap_or(false) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(UploadResponse {
+                        success: false,
+                        message: "Cannot send to banned user".to_string(),
+                        file_id: None,
+                    }),
+                );
+            }
+            r
+        },
         _ => {
             return (
                 StatusCode::NOT_FOUND,
@@ -69,7 +96,9 @@ pub async fn upload_file(
         }
     };
     
-    // Check if sender is blocked by recipient
+    let recipient_id = recipient.id;
+    
+    // Check blocking
     if is_blocked(&pool, recipient_id, user_id).await {
         return (
             StatusCode::FORBIDDEN,
@@ -81,13 +110,24 @@ pub async fn upload_file(
         );
     }
     
-    // Check if recipient is blocked by sender
     if is_blocked(&pool, user_id, recipient_id).await {
         return (
             StatusCode::FORBIDDEN,
             Json(UploadResponse {
                 success: false,
                 message: "You have blocked this user".to_string(),
+                file_id: None,
+            }),
+        );
+    }
+    
+    // Validate encrypted_session_key is not a temp placeholder
+    if payload.encrypted_session_key.starts_with("temp_key_") || payload.encrypted_session_key.len() < 10 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(UploadResponse {
+                success: false,
+                message: "Invalid session key format".to_string(),
                 file_id: None,
             }),
         );
@@ -111,11 +151,16 @@ pub async fn upload_file(
         }
     };
     
+    // Store the length before moving file_data
+    let file_size = file_data.len() as i64;
+    
+    // Create directory if it doesn't exist
     if let Some(parent) = PathBuf::from(&file_path).parent() {
         let _ = fs::create_dir_all(parent).await;
     }
     
-    if let Err(e) = fs::write(&file_path, file_data).await {
+    // Write file - use clone if needed, but we don't need file_data after this
+    if let Err(e) = fs::write(&file_path, &file_data).await {  // Use reference &file_data
         eprintln!("Write error: {}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -133,7 +178,7 @@ pub async fn upload_file(
     let expires_at_naive = expires_at.naive_utc();
     let pending_expires_at_naive = pending_expires_at.naive_utc();
     
-    let _result = sqlx::query!(
+    let result = sqlx::query!(
         "INSERT INTO files (id, sender_id, recipient_id, encrypted_file_path, encrypted_session_key, 
          encrypted_filename, file_size, custom_expiry_days, expires_at, pending_expires_at, status)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')",
@@ -143,7 +188,7 @@ pub async fn upload_file(
         file_path,
         payload.encrypted_session_key,
         payload.encrypted_filename,
-        payload.encrypted_data.len() as i64,
+        file_size,  // Use the stored length
         custom_days,
         expires_at_naive,
         pending_expires_at_naive
@@ -151,7 +196,7 @@ pub async fn upload_file(
     .execute(&pool)
     .await;
     
-    match _result {
+    match result {
         Ok(_) => {
             println!("File saved: {} from {} to {}", file_id, user_id, recipient_id);
             (
@@ -178,11 +223,11 @@ pub async fn upload_file(
     }
 }
 
+// ============ LIST PENDING FILES ============
 pub async fn list_pending_files(
     Extension(pool): Extension<PgPool>,
     Extension(user_id): Extension<Uuid>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Get list of users blocked by current user
     let blocked_by_me = sqlx::query_scalar!(
         "SELECT array_agg(blocked_user_id) FROM blocked_users WHERE user_id = $1",
         user_id
@@ -192,7 +237,6 @@ pub async fn list_pending_files(
     .unwrap_or(None)
     .unwrap_or(vec![]);
     
-    // Get list of users who blocked current user
     let blocked_me = sqlx::query_scalar!(
         "SELECT array_agg(user_id) FROM blocked_users WHERE blocked_user_id = $1",
         user_id
@@ -245,6 +289,7 @@ pub async fn list_pending_files(
     }
 }
 
+// ============ LIST SENT FILES ============
 pub async fn list_sent_files(
     Extension(pool): Extension<PgPool>,
     Extension(user_id): Extension<Uuid>,
@@ -310,6 +355,7 @@ pub async fn list_sent_files(
     }
 }
 
+// ============ LIST RECEIVED FILES ============
 pub async fn list_received_files(
     Extension(pool): Extension<PgPool>,
     Extension(user_id): Extension<Uuid>,
@@ -375,6 +421,7 @@ pub async fn list_received_files(
     }
 }
 
+// ============ ACCEPT FILE ============
 pub async fn accept_file(
     Extension(pool): Extension<PgPool>,
     Extension(user_id): Extension<Uuid>,
@@ -394,7 +441,7 @@ pub async fn accept_file(
         ),
         Ok(_) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "success": false, "message": "File not found" })),
+            Json(serde_json::json!({ "success": false, "message": "File not found or already processed" })),
         ),
         Err(e) => {
             eprintln!("Accept error: {}", e);
@@ -406,6 +453,7 @@ pub async fn accept_file(
     }
 }
 
+// ============ DECLINE FILE ============
 pub async fn decline_file(
     Extension(pool): Extension<PgPool>,
     Extension(user_id): Extension<Uuid>,
@@ -443,6 +491,7 @@ pub async fn decline_file(
     )
 }
 
+// ============ CANCEL FILE ============
 pub async fn cancel_file(
     Extension(pool): Extension<PgPool>,
     Extension(user_id): Extension<Uuid>,
@@ -460,7 +509,7 @@ pub async fn cancel_file(
         _ => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "success": false, "message": "File not found" })),
+                Json(serde_json::json!({ "success": false, "message": "File not found or already processed" })),
             );
         }
     };
@@ -480,6 +529,7 @@ pub async fn cancel_file(
     )
 }
 
+// ============ DOWNLOAD FILE ============
 pub async fn download_file(
     Extension(pool): Extension<PgPool>,
     Extension(user_id): Extension<Uuid>,
@@ -527,4 +577,135 @@ pub async fn download_file(
             "encrypted_filename": file.encrypted_filename
         })),
     )
+}
+
+// ============ GET USER PUBLIC KEY BY USERNAME ============
+pub async fn get_public_key_by_username(
+    Extension(pool): Extension<PgPool>,
+    Path(username): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let user = sqlx::query!(
+        "SELECT public_key FROM users WHERE username = $1",
+        username
+    )
+    .fetch_optional(&pool)
+    .await;
+    
+    match user {
+        Ok(Some(u)) => {
+            // FIXED: public_key is Option<String>, need to handle it properly
+            match u.public_key {
+                Some(key) if !key.is_empty() => {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "success": true,
+                            "public_key": key
+                        })),
+                    )
+                }
+                _ => {
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({
+                            "success": false,
+                            "message": "User has not uploaded a public key"
+                        })),
+                    )
+                }
+            }
+        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "success": false,
+                "message": "User not found"
+            })),
+        )
+    }
+}
+
+// ============ CHECK USER STATUS ============
+pub async fn check_user_status(
+    Extension(pool): Extension<PgPool>,
+    Path(username): Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let user = sqlx::query!(
+        "SELECT is_banned FROM users WHERE username = $1",
+        username
+    )
+    .fetch_optional(&pool)
+    .await;
+    
+    match user {
+        Ok(Some(u)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "exists": true,
+                "is_banned": u.is_banned.unwrap_or(false)
+            })),
+        ),
+        Ok(None) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "exists": false,
+                "is_banned": false
+            })),
+        ),
+        Err(e) => {
+            eprintln!("User status error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "message": "Failed to check user status"
+                })),
+            )
+        }
+    }
+}
+
+// ============ SEARCH USERS ============
+pub async fn search_users(
+    Extension(pool): Extension<PgPool>,
+    axum::extract::Query(params): axum::extract::Query<SearchParams>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let query = format!("%{}%", params.q);
+    
+    let users = sqlx::query!(
+        "SELECT username FROM users WHERE username ILIKE $1 LIMIT 10",
+        query
+    )
+    .fetch_all(&pool)
+    .await;
+    
+    match users {
+        Ok(rows) => {
+            let usernames: Vec<String> = rows.into_iter().map(|r| r.username).collect();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    "users": usernames
+                })),
+            )
+        }
+        Err(e) => {
+            eprintln!("Search error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "success": false,
+                    "users": []
+                })),
+            )
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SearchParams {
+    pub q: String,
 }
