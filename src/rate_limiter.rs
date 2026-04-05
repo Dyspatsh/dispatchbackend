@@ -1,156 +1,131 @@
-//! Simple IP-based rate limiter for auth endpoints
-//! Uses in-memory HashMap with automatic cleanup
-
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Instant, Duration};
+use once_cell::sync::Lazy;
 use axum::{
     http::{Request, StatusCode},
-    response::{IntoResponse, Response},
     middleware::Next,
-    extract::Extension,
+    response::Response,
+    body::Body,
 };
-use axum::body::Body;
 
-/// Rate limiter configuration
-#[derive(Clone)]
-pub struct RateLimiterConfig {
-    pub max_requests: u32,
-    pub window_seconds: u64,
+// Rate limiter state with better tracking
+#[derive(Debug, Clone)]
+struct RateLimitEntry {
+    timestamps: Vec<Instant>,
+    count: usize,
 }
 
-impl Default for RateLimiterConfig {
-    fn default() -> Self {
-        Self {
-            max_requests: 5,
-            window_seconds: 60,
-        }
-    }
-}
+static RATE_LIMITER: Lazy<Mutex<HashMap<String, RateLimitEntry>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
-/// Rate limiter state stored in memory
-#[derive(Clone)]
-pub struct RateLimiter {
-    requests: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
-    config: RateLimiterConfig,
-}
+pub struct RateLimiter;
 
 impl RateLimiter {
-    pub fn new(config: RateLimiterConfig) -> Self {
-        Self {
-            requests: Arc::new(Mutex::new(HashMap::new())),
-            config,
-        }
-    }
-
-    /// Check if a request from an IP is allowed
-    pub fn is_allowed(&self, ip: &str) -> bool {
+    pub fn check_limit(key: &str, max_requests: usize, window_secs: u64) -> bool {
         let now = Instant::now();
-        let window = Duration::from_secs(self.config.window_seconds);
+        let window = Duration::from_secs(window_secs);
         
-        let mut requests = self.requests.lock().unwrap();
-        let ip_requests = requests.entry(ip.to_string()).or_insert_with(Vec::new);
+        let mut map = RATE_LIMITER.lock().unwrap();
+        let entry = map.entry(key.to_string()).or_insert(RateLimitEntry {
+            timestamps: Vec::new(),
+            count: 0,
+        });
         
-        // Remove old requests outside the window
-        ip_requests.retain(|&timestamp| now.duration_since(timestamp) < window);
+        // Remove old timestamps
+        entry.timestamps.retain(|&timestamp| timestamp.elapsed() < window);
         
         // Check if under limit
-        if ip_requests.len() < self.config.max_requests as usize {
-            ip_requests.push(now);
+        if entry.timestamps.len() < max_requests {
+            entry.timestamps.push(now);
+            entry.count += 1;
             true
         } else {
             false
         }
     }
-
-    /// Clean up old entries (call periodically)
-    pub fn cleanup(&self) {
-        let now = Instant::now();
-        let window = Duration::from_secs(self.config.window_seconds);
-        
-        let mut requests = self.requests.lock().unwrap();
-        requests.retain(|_, timestamps| {
-            timestamps.retain(|&t| now.duration_since(t) < window);
-            !timestamps.is_empty()
+    
+    pub fn cleanup_old_entries() {
+        let mut map = RATE_LIMITER.lock().unwrap();
+        map.retain(|_, entry| {
+            entry.timestamps.retain(|&timestamp| timestamp.elapsed() < Duration::from_secs(3600));
+            !entry.timestamps.is_empty()
         });
     }
-}
-
-/// Get client IP from request
-fn get_client_ip<B>(req: &Request<B>) -> String {
-    // Try X-Forwarded-For header first (for proxies)
-    if let Some(forwarded) = req.headers().get("x-forwarded-for") {
-        if let Ok(forwarded_str) = forwarded.to_str() {
-            if let Some(ip) = forwarded_str.split(',').next() {
-                return ip.trim().to_string();
+    
+    pub fn get_remaining(key: &str, max_requests: usize, window_secs: u64) -> usize {
+        let window = Duration::from_secs(window_secs);
+        let map = RATE_LIMITER.lock().unwrap();
+        
+        if let Some(entry) = map.get(key) {
+            let valid_requests: Vec<_> = entry.timestamps.iter()
+                .filter(|&&timestamp| timestamp.elapsed() < window)
+                .collect();
+            
+            if valid_requests.len() >= max_requests {
+                0
+            } else {
+                max_requests - valid_requests.len()
             }
+        } else {
+            max_requests
         }
     }
-    
-    // Try X-Real-IP header
-    if let Some(real_ip) = req.headers().get("x-real-ip") {
-        if let Ok(ip) = real_ip.to_str() {
-            return ip.to_string();
-        }
-    }
-    
-    // Fallback to socket address
-    if let Some(addr) = req.extensions().get::<std::net::SocketAddr>() {
-        return addr.ip().to_string();
-    }
-    
-    "unknown".to_string()
 }
 
-/// Rate limiting middleware for login and recovery (5 requests per minute)
-pub async fn auth_rate_limit_middleware(
-    Extension(limiter): Extension<RateLimiter>,
+pub async fn rate_limit_middleware(
     req: Request<Body>,
     next: Next,
-) -> Response {
-    let ip = get_client_ip(&req);
+) -> Result<Response, StatusCode> {
+    // Get client IP or use a unique identifier
+    let client_ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| req.headers().get("x-real-ip").and_then(|h| h.to_str().ok()))
+        .unwrap_or("unknown")
+        .to_string();
     
-    if limiter.is_allowed(&ip) {
-        next.run(req).await
+    // Create a key based on IP and path
+    let key = format!("{}:{}", client_ip, req.uri().path());
+    
+    // Different limits for different endpoints
+    let (max_requests, window_secs) = if req.uri().path().starts_with("/auth/") {
+        (5, 60) // 5 requests per minute for auth
     } else {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            axum::Json(serde_json::json!({
-                "success": false,
-                "message": "Rate limit exceeded. Too many attempts. Please try again later."
-            })),
-        ).into_response()
+        (30, 60) // 30 requests per minute for other endpoints
+    };
+    
+    if RateLimiter::check_limit(&key, max_requests, window_secs) {
+        let remaining = RateLimiter::get_remaining(&key, max_requests, window_secs);
+        let mut response = next.run(req).await;
+        
+        // Add rate limit headers
+        response.headers_mut().insert(
+            "X-RateLimit-Limit",
+            axum::http::HeaderValue::from_str(&max_requests.to_string()).unwrap()
+        );
+        response.headers_mut().insert(
+            "X-RateLimit-Remaining",
+            axum::http::HeaderValue::from_str(&remaining.to_string()).unwrap()
+        );
+        response.headers_mut().insert(
+            "X-RateLimit-Reset",
+            axum::http::HeaderValue::from_str(&window_secs.to_string()).unwrap()
+        );
+        
+        Ok(response)
+    } else {
+        Err(StatusCode::TOO_MANY_REQUESTS)
     }
 }
 
-/// Stricter rate limiting middleware for registration (3 requests per 5 minutes)
-pub async fn register_rate_limit_middleware(
-    Extension(limiter): Extension<RateLimiter>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let ip = get_client_ip(&req);
-    
-    if limiter.is_allowed(&ip) {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::TOO_MANY_REQUESTS,
-            axum::Json(serde_json::json!({
-                "success": false,
-                "message": "Rate limit exceeded. Too many registration attempts. Please try again later."
-            })),
-        ).into_response()
-    }
-}
-
-/// Spawn cleanup task to prevent memory leaks
-pub fn start_cleanup_task(limiter: RateLimiter) {
+// Cleanup task for rate limiter
+pub fn start_rate_limiter_cleanup() {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(300)); // Clean every 5 minutes
+        let mut interval = tokio::time::interval(Duration::from_secs(3600));
         loop {
             interval.tick().await;
-            limiter.cleanup();
+            RateLimiter::cleanup_old_entries();
         }
     });
 }

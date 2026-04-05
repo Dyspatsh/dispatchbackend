@@ -1,7 +1,8 @@
 use axum::{extract::Extension, http::StatusCode, response::Json, Json as AxumJson};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::app_state::AppState;
 
 #[derive(Deserialize)]
 pub struct UploadPublicKeyRequest {
@@ -14,12 +15,25 @@ pub struct UploadPublicKeyResponse {
     pub message: String,
 }
 
+const MAX_PUBLIC_KEY_SIZE: usize = 4096; // 4KB limit for public keys
+
 pub async fn upload_public_key(
-    Extension(pool): Extension<PgPool>,
+    Extension(state): Extension<AppState>,
     Extension(user_id): Extension<Uuid>,
     AxumJson(payload): AxumJson<UploadPublicKeyRequest>,
 ) -> (StatusCode, Json<UploadPublicKeyResponse>) {
-    // Accept any non-empty public key (will accept real XML)
+    // Check size limit
+    if payload.public_key.len() > MAX_PUBLIC_KEY_SIZE {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(UploadPublicKeyResponse {
+                success: false,
+                message: format!("Public key too large. Maximum {} characters", MAX_PUBLIC_KEY_SIZE),
+            }),
+        );
+    }
+    
+    // Validate it's a non-empty string
     if payload.public_key.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -30,13 +44,19 @@ pub async fn upload_public_key(
         );
     }
     
+    // Optional: Validate XML structure (basic check)
+    if !payload.public_key.trim().starts_with("<?xml") && !payload.public_key.trim().starts_with("<RSAKey") {
+        // Log warning but still accept (some valid keys might not have XML header)
+        tracing::warn!("Public key doesn't look like XML: {}", &payload.public_key[..payload.public_key.len().min(50)]);
+    }
+    
     // Update user's public key
     let result = sqlx::query!(
         "UPDATE users SET public_key = $1 WHERE id = $2",
         payload.public_key,
         user_id
     )
-    .execute(&pool)
+    .execute(&state.pool)
     .await;
     
     match result {

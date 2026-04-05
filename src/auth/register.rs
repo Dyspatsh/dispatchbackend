@@ -1,10 +1,11 @@
 use axum::{extract::Extension, http::StatusCode, response::Json, Json as AxumJson};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+//use sqlx::PgPool;
 use bcrypt::{hash, DEFAULT_COST};
 use uuid::Uuid;
+//use std::sync::Arc;
 
-use super::recovery_phrase::generate_recovery_phrase;
+use crate::app_state::AppState;
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
@@ -36,7 +37,7 @@ fn is_valid_password(password: &str) -> bool {
     }
     let has_letter = password.chars().any(|c| c.is_ascii_alphabetic());
     let has_number = password.chars().any(|c| c.is_ascii_digit());
-    let has_symbol = password.chars().any(|c| !c.is_ascii_alphanumeric());
+    let has_symbol = password.chars().any(|c| !c.is_ascii_alphanumeric() && c != ' ');
     has_letter && has_number && has_symbol
 }
 
@@ -50,8 +51,19 @@ fn sanitize_input(input: &str) -> String {
     input.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
 }
 
+// Generate recovery phrase (BIP39 24 words)
+fn generate_recovery_phrase() -> String {
+    use bip39::Mnemonic;
+    use rand::RngCore;
+    
+    let mut entropy = vec![0u8; 32];
+    rand::thread_rng().fill_bytes(&mut entropy);
+    let mnemonic = Mnemonic::from_entropy(&entropy).expect("Failed to create mnemonic");
+    mnemonic.to_string()
+}
+
 pub async fn register(
-    Extension(pool): Extension<PgPool>,
+    Extension(state): Extension<AppState>,
     AxumJson(payload): AxumJson<RegisterRequest>,
 ) -> (StatusCode, Json<RegisterResponse>) {
     // Sanitize inputs
@@ -76,7 +88,7 @@ pub async fn register(
             StatusCode::BAD_REQUEST,
             Json(RegisterResponse {
                 success: false,
-                message: "Password must be 12-16 characters with letters, numbers, and symbols".to_string(),
+                message: "Password must be 12-16 characters with letters, numbers, and symbols (spaces not allowed)".to_string(),
                 recovery_phrase: None,
                 user_id: None,
             }),
@@ -101,7 +113,7 @@ pub async fn register(
         "SELECT EXISTS(SELECT 1 FROM users WHERE username = $1)"
     )
     .bind(&username)
-    .fetch_one(&pool)
+    .fetch_one(&state.pool)
     .await
     .unwrap_or(false);
     
@@ -118,9 +130,9 @@ pub async fn register(
     }
     
     // Generate cryptographically secure 24-word recovery phrase
-    let (recovery_phrase, _entropy) = generate_recovery_phrase();
+    let recovery_phrase = generate_recovery_phrase();
     
-    // Hash password and PIN
+    // Hash password, PIN, and recovery phrase
     let password_hash = match hash(&payload.password, DEFAULT_COST) {
         Ok(h) => h,
         Err(e) => {
@@ -171,9 +183,26 @@ pub async fn register(
     
     let user_id = Uuid::new_v4();
     
+    // Use transaction for atomicity
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            eprintln!("Transaction error: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RegisterResponse {
+                    success: false,
+                    message: "Registration failed".to_string(),
+                    recovery_phrase: None,
+                    user_id: None,
+                }),
+            );
+        }
+    };
+    
     let result = sqlx::query(
-        "INSERT INTO users (id, username, password_hash, pin_hash, recovery_phrase_hash, storage_used_mb, storage_limit_mb) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7)"
+        "INSERT INTO users (id, username, password_hash, pin_hash, recovery_phrase_hash, storage_used_mb, storage_limit_mb, username_hash) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7, ENCODE(SHA256($2::bytea), 'hex'))"
     )
     .bind(user_id)
     .bind(&username)
@@ -182,20 +211,42 @@ pub async fn register(
     .bind(recovery_hash)
     .bind(0i64)  // storage_used_mb starts at 0
     .bind(1024i64)  // storage_limit_mb = 1GB for free tier
-    .execute(&pool)
+    .execute(&mut *tx)
     .await;
     
     match result {
-        Ok(_) => (
-            StatusCode::CREATED,
-            Json(RegisterResponse {
-                success: true,
-                message: "User registered. SAVE THESE 24 WORDS! They are your ONLY recovery method.".to_string(),
-                recovery_phrase: Some(recovery_phrase),
-                user_id: Some(user_id),
-            }),
-        ),
+        Ok(_) => {
+            match tx.commit().await {
+                Ok(_) => {
+                    // Log successful registration (but NOT the recovery phrase!)
+                    tracing::info!("User registered successfully: {}", username);
+                    
+                    (
+                        StatusCode::CREATED,
+                        Json(RegisterResponse {
+                            success: true,
+                            message: "User registered. SAVE THESE 24 WORDS! They are your ONLY recovery method. This message will not be shown again.".to_string(),
+                            recovery_phrase: Some(recovery_phrase),
+                            user_id: Some(user_id),
+                        }),
+                    )
+                },
+                Err(e) => {
+                    eprintln!("Commit error: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(RegisterResponse {
+                            success: false,
+                            message: "Registration failed".to_string(),
+                            recovery_phrase: None,
+                            user_id: None,
+                        }),
+                    )
+                }
+            }
+        },
         Err(e) => {
+            let _ = tx.rollback().await;
             eprintln!("Registration error: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -209,3 +260,4 @@ pub async fn register(
         }
     }
 }
+

@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use axum::{
     extract::{Extension, Path},
     http::StatusCode,
@@ -382,60 +383,6 @@ pub async fn upload_file(
 }
 
 // ============ GET STORAGE INFO ============
-pub async fn get_storage_info(
-    Extension(pool): Extension<PgPool>,
-    Extension(user_id): Extension<Uuid>,
-) -> (StatusCode, Json<StorageInfoResponse>) {
-    let result = sqlx::query!(
-        "SELECT storage_used_mb, storage_limit_mb FROM users WHERE id = $1",
-        user_id
-    )
-    .fetch_optional(&pool)
-    .await;
-    
-    match result {
-        Ok(Some(row)) => {
-            let used_mb = row.storage_used_mb.unwrap_or(0);
-            let limit_mb = row.storage_limit_mb.unwrap_or(1024);
-            let available_mb = limit_mb - used_mb;
-            let percentage_used = (used_mb as f64 / limit_mb as f64) * 100.0;
-            
-            (
-                StatusCode::OK,
-                Json(StorageInfoResponse {
-                    success: true,
-                    used_mb,
-                    limit_mb,
-                    available_mb,
-                    percentage_used,
-                }),
-            )
-        }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(StorageInfoResponse {
-                success: false,
-                used_mb: 0,
-                limit_mb: 0,
-                available_mb: 0,
-                percentage_used: 0.0,
-            }),
-        ),
-        Err(e) => {
-            eprintln!("Storage info error: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(StorageInfoResponse {
-                    success: false,
-                    used_mb: 0,
-                    limit_mb: 0,
-                    available_mb: 0,
-                    percentage_used: 0.0,
-                }),
-            )
-        }
-    }
-}
 
 // ============ LIST PENDING FILES ============
 pub async fn list_pending_files(

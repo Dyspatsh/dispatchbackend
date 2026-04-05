@@ -11,36 +11,49 @@ use std::env;
 use sqlx::postgres::PgPoolOptions;
 use uuid::Uuid;
 
+mod app_state;
 mod auth;
 mod handlers;
+mod rate_limiter;
 
+use app_state::AppState;
 use auth::register::register;
 use auth::login::login;
 use auth::recovery::recover_account;
 use auth::public_key::upload_public_key;
 use handlers::*;
+use rate_limiter::{rate_limit_middleware, start_rate_limiter_cleanup};
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Claims {
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct Claims {
     sub: String,
     exp: usize,
     role: String,
 }
 
 async fn auth_middleware(
-    mut req: axum::http::Request<axum::body::Body>,
+    req: axum::http::Request<axum::body::Body>,
     next: middleware::Next,
 ) -> Result<axum::response::Response, axum::response::Response> {
+    // Extract state from request extensions - NOT wrapped in Arc
+    let state = req.extensions()
+        .get::<AppState>()
+        .cloned()
+        .ok_or_else(|| {
+            axum::response::Response::builder()
+                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from("Internal server error - State not found"))
+                .unwrap()
+        })?;
+    
     let auth_header = req.headers()
         .get("Authorization")
         .and_then(|h| h.to_str().ok());
 
-    let user_id = if let Some(header) = auth_header {
+    let user_id_result = if let Some(header) = auth_header {
         if header.starts_with("Bearer ") {
             let token = &header[7..];
-            use jsonwebtoken::{decode, DecodingKey, Validation};
-
-            let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+            use jsonwebtoken::{decode, Validation};
 
             let mut validation = Validation::default();
             validation.validate_exp = true;
@@ -48,7 +61,7 @@ async fn auth_middleware(
 
             let decoded = decode::<Claims>(
                 token,
-                &DecodingKey::from_secret(jwt_secret.as_bytes()),
+                &state.jwt_decoding_key,
                 &validation,
             );
 
@@ -70,13 +83,48 @@ async fn auth_middleware(
         } else { None }
     } else { None };
 
-    if let Some(uid) = user_id {
-        req.extensions_mut().insert(uid);
-        Ok(next.run(req).await)
-    } else {
-        let mut response = axum::response::Response::new(axum::body::Body::from("Unauthorized"));
-        *response.status_mut() = axum::http::StatusCode::UNAUTHORIZED;
-        Ok(response)
+    let user_id = match user_id_result {
+        Some(uid) => uid,
+        None => {
+            return Err(axum::response::Response::builder()
+                .status(axum::http::StatusCode::UNAUTHORIZED)
+                .body(axum::body::Body::from("Unauthorized"))
+                .unwrap());
+        }
+    };
+
+    // Verify user still exists and is not banned
+    let user_check = sqlx::query!(
+        "SELECT is_banned FROM users WHERE id = $1",
+        user_id
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| {
+        axum::response::Response::builder()
+            .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+            .body(axum::body::Body::from("Database error"))
+            .unwrap()
+    })?;
+    
+    match user_check {
+        Some(user) if !user.is_banned.unwrap_or(false) => {
+            let mut req = req;
+            req.extensions_mut().insert(user_id);
+            Ok(next.run(req).await)
+        }
+        Some(_) => {
+            Err(axum::response::Response::builder()
+                .status(axum::http::StatusCode::FORBIDDEN)
+                .body(axum::body::Body::from("Account is banned"))
+                .unwrap())
+        }
+        None => {
+            Err(axum::response::Response::builder()
+                .status(axum::http::StatusCode::UNAUTHORIZED)
+                .body(axum::body::Body::from("User not found"))
+                .unwrap())
+        }
     }
 }
 
@@ -92,6 +140,9 @@ async fn main() {
         .await
         .expect("Failed to connect to database");
 
+    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    let state = AppState::new(pool, jwt_secret).await;  // Don't wrap in Arc
+
     let port = env::var("SERVER_PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
@@ -103,6 +154,7 @@ async fn main() {
         .collect();
 
     println!("CORS allowed origins: {:?}", allowed_origins);
+    println!("Starting server on http://{}", addr);
 
     // CORS configuration
     let cors = CorsLayer::new()
@@ -142,12 +194,15 @@ async fn main() {
         .route("/files/download/:file_id", get(download_file))
         .layer(middleware::from_fn(auth_middleware));
 
+    // Apply rate limiting to all routes
     let app = public_routes
         .merge(protected_routes)
+        .layer(middleware::from_fn(rate_limit_middleware))
         .layer(cors)
-        .layer(Extension(pool));
+        .layer(Extension(state));  // Add state as extension (not Arc)
 
-    println!("Dispatch server running on http://{}", addr);
+    // Start rate limiter cleanup task
+    start_rate_limiter_cleanup();
 
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

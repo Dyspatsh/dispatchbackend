@@ -4,11 +4,12 @@ use axum::{
     response::Json,
 };
 use serde_json::json;
-use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::app_state::AppState;
+
 pub async fn block_user(
-    Extension(pool): Extension<PgPool>,
+    Extension(state): Extension<AppState>,
     Extension(user_id): Extension<Uuid>,
     Path(username): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -16,7 +17,7 @@ pub async fn block_user(
         "SELECT id FROM users WHERE username = $1",
         username
     )
-    .fetch_optional(&pool)
+    .fetch_optional(&state.pool)
     .await;
     
     let target_id = match target_user {
@@ -41,7 +42,7 @@ pub async fn block_user(
         user_id,
         target_id
     )
-    .execute(&pool)
+    .execute(&state.pool)
     .await;
     
     match result {
@@ -60,7 +61,7 @@ pub async fn block_user(
 }
 
 pub async fn unblock_user(
-    Extension(pool): Extension<PgPool>,
+    Extension(state): Extension<AppState>,
     Extension(user_id): Extension<Uuid>,
     Path(username): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -68,7 +69,7 @@ pub async fn unblock_user(
         "SELECT id FROM users WHERE username = $1",
         username
     )
-    .fetch_optional(&pool)
+    .fetch_optional(&state.pool)
     .await;
     
     let target_id = match target_user {
@@ -86,7 +87,7 @@ pub async fn unblock_user(
         user_id,
         target_id
     )
-    .execute(&pool)
+    .execute(&state.pool)
     .await;
     
     match result {
@@ -105,14 +106,14 @@ pub async fn unblock_user(
 }
 
 pub async fn get_blocked_users(
-    Extension(pool): Extension<PgPool>,
+    Extension(state): Extension<AppState>,
     Extension(user_id): Extension<Uuid>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let blocked = sqlx::query!(
         "SELECT u.username FROM blocked_users b JOIN users u ON b.blocked_user_id = u.id WHERE b.user_id = $1",
         user_id
     )
-    .fetch_all(&pool)
+    .fetch_all(&state.pool)
     .await;
     
     match blocked {
@@ -134,7 +135,7 @@ pub async fn get_blocked_users(
 }
 
 pub async fn is_blocked_by(
-    Extension(pool): Extension<PgPool>,
+    Extension(state): Extension<AppState>,
     Extension(user_id): Extension<Uuid>,
     Path(username): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -142,7 +143,7 @@ pub async fn is_blocked_by(
         "SELECT id FROM users WHERE username = $1",
         username
     )
-    .fetch_optional(&pool)
+    .fetch_optional(&state.pool)
     .await;
     
     let target_id = match target_user {
@@ -160,7 +161,7 @@ pub async fn is_blocked_by(
         target_id,
         user_id
     )
-    .fetch_one(&pool)
+    .fetch_one(&state.pool)
     .await
     .unwrap_or(Some(false))
     .unwrap_or(false);

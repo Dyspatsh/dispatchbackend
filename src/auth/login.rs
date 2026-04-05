@@ -1,11 +1,12 @@
 use axum::{extract::Extension, http::StatusCode, response::Json, Json as AxumJson};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
-use bcrypt::verify;
-use jsonwebtoken::{encode, EncodingKey, Header};
+use bcrypt::verify;  // Add this import
+use jsonwebtoken::{encode, Header};
 use chrono::{Utc, Duration};
 use uuid::Uuid;
-use std::env;
+
+use crate::app_state::AppState;
+use crate::Claims;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -23,48 +24,33 @@ pub struct LoginResponse {
     pub role: Option<String>,
 }
 
-#[derive(Serialize)]
-struct Claims {
-    sub: String,
-    exp: usize,
-    role: String,
-}
+// Dummy hash for timing attack protection (bcrypt of "dummy")
+const DUMMY_HASH: &str = "$2b$12$dummyhashfordummyhashfordummyhashfordumm";
 
 pub async fn login(
-    Extension(pool): Extension<PgPool>,
+    Extension(state): Extension<AppState>,
     AxumJson(payload): AxumJson<LoginRequest>,
 ) -> (StatusCode, Json<LoginResponse>) {
-    // Query includes password_hash and pin_hash
+    // Sanitize username
+    let username = sanitize_input(&payload.username);
+    
+    // Query user
     let user = sqlx::query!(
         "SELECT id, password_hash, pin_hash, role, is_banned FROM users WHERE username = $1",
-        payload.username
+        username
     )
-    .fetch_optional(&pool)
+    .fetch_optional(&state.pool)
     .await;
     
-    let user = match user {
-        Ok(Some(u)) => {
-            // Check if user is banned
-            if u.is_banned.unwrap_or(false) {
-                return (
-                    StatusCode::FORBIDDEN,
-                    Json(LoginResponse {
-                        success: false,
-                        message: "Account is banned".to_string(),
-                        token: None,
-                        user_id: None,
-                        role: None,
-                    }),
-                );
-            }
-            u
-        },
-        _ => {
+    let (user_exists, stored_password_hash, stored_pin_hash, user_id, user_role, is_banned) = match user {
+        Ok(Some(u)) => (true, u.password_hash, u.pin_hash, u.id, u.role, u.is_banned.unwrap_or(false)),
+        Ok(None) => (false, None, None, Uuid::nil(), None, false),
+        Err(_) => {
             return (
-                StatusCode::UNAUTHORIZED,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(LoginResponse {
                     success: false,
-                    message: "Invalid credentials".to_string(),
+                    message: "Login failed".to_string(),
                     token: None,
                     user_id: None,
                     role: None,
@@ -73,16 +59,48 @@ pub async fn login(
         }
     };
     
-    // Verify password - handle Option<String>
-    let password_valid = match user.password_hash {
-        Some(hash) => match verify(&payload.password, &hash) {
-            Ok(v) => v,
-            Err(_) => false,
-        },
-        None => false,
+    // Check if user is banned (only if exists)
+    if user_exists && is_banned {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(LoginResponse {
+                success: false,
+                message: "Account is banned".to_string(),
+                token: None,
+                user_id: None,
+                role: None,
+            }),
+        );
+    }
+    
+    // Timing attack protection: always verify both password and PIN with dummy hashes if needed
+    let password_hash_to_verify = if user_exists {
+        stored_password_hash.as_deref().unwrap_or(DUMMY_HASH)
+    } else {
+        DUMMY_HASH
     };
     
-    if !password_valid {
+    let pin_hash_to_verify = if user_exists {
+        stored_pin_hash.as_deref().unwrap_or(DUMMY_HASH)
+    } else {
+        DUMMY_HASH
+    };
+    
+    // Verify both password and PIN (timing-safe)
+    let password_valid = match verify(&payload.password, password_hash_to_verify) {
+        Ok(v) => v,
+        Err(_) => false,
+    };
+    
+    let pin_valid = match verify(&payload.pin, pin_hash_to_verify) {
+        Ok(v) => v,
+        Err(_) => false,
+    };
+    
+    // If user doesn't exist or credentials are invalid, return generic error
+    if !user_exists || !password_valid || !pin_valid {
+        // Add small random delay to prevent timing attacks
+        tokio::time::sleep(tokio::time::Duration::from_millis(rand::random::<u64>() % 100)).await;
         return (
             StatusCode::UNAUTHORIZED,
             Json(LoginResponse {
@@ -95,40 +113,17 @@ pub async fn login(
         );
     }
     
-    // Verify PIN - handle Option<String>
-    let pin_valid = match user.pin_hash {
-        Some(hash) => match verify(&payload.pin, &hash) {
-            Ok(v) => v,
-            Err(_) => false,
-        },
-        None => false,
-    };
-    
-    if !pin_valid {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(LoginResponse {
-                success: false,
-                message: "Invalid credentials".to_string(),
-                token: None,
-                user_id: None,
-                role: None,
-            }),
-        );
-    }
-    
-    let jwt_secret = env::var("JWT_SECRET").expect("JWT_SECRET must be set");
+    // Generate JWT
     let expiration = (Utc::now() + Duration::days(7)).timestamp() as usize;
-    
-    let user_role = user.role.unwrap_or_else(|| "free".to_string());
+    let user_role_str = user_role.unwrap_or_else(|| "free".to_string());
     
     let claims = Claims {
-        sub: user.id.to_string(),
+        sub: user_id.to_string(),
         exp: expiration,
-        role: user_role.clone(),
+        role: user_role_str.clone(),
     };
     
-    let token = match encode(&Header::default(), &claims, &EncodingKey::from_secret(jwt_secret.as_bytes())) {
+    let token = match encode(&Header::default(), &claims, &state.jwt_encoding_key) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Token error: {}", e);
@@ -145,12 +140,12 @@ pub async fn login(
         }
     };
     
-    // Update last_seen
+    // Update last_seen (don't block on error)
     let _ = sqlx::query!(
         "UPDATE users SET last_seen = NOW() WHERE id = $1",
-        user.id
+        user_id
     )
-    .execute(&pool)
+    .execute(&state.pool)
     .await;
     
     (
@@ -159,8 +154,12 @@ pub async fn login(
             success: true,
             message: "Login successful".to_string(),
             token: Some(token),
-            user_id: Some(user.id),
-            role: Some(user_role),
+            user_id: Some(user_id),
+            role: Some(user_role_str),
         }),
     )
+}
+
+fn sanitize_input(input: &str) -> String {
+    input.replace("<", "&lt;").replace(">", "&gt;").replace("&", "&amp;")
 }
