@@ -95,15 +95,22 @@ async fn main() {
     let port = env::var("SERVER_PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
 
+    // Read allowed origins from environment variable
+    let allowed_origins: Vec<axum::http::HeaderValue> = env::var("ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "https://localhost".to_string())
+        .split(',')
+        .filter_map(|s| s.trim().parse().ok())
+        .collect();
+
+    println!("CORS allowed origins: {:?}", allowed_origins);
+
     // CORS configuration
     let cors = CorsLayer::new()
-	.allow_origin("https://localhost".parse::<axum::http::HeaderValue>().unwrap())
-	.allow_origin("https://your-server-ip".parse::<axum::http::HeaderValue>().unwrap())
+        .allow_origin(allowed_origins)
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_headers(Any);
 
-    // Request size limit (10MB for uploads)
-    let request_limit = RequestBodyLimitLayer::new(10 * 1024 * 1024); // 10MB limit
+    let request_limit = RequestBodyLimitLayer::new(100 * 1024 * 1024); // 100MB limit
 
     // Public routes (no auth required)
     let public_routes = Router::new()
@@ -124,6 +131,7 @@ async fn main() {
         .route("/users/blocked", get(get_blocked_users))
         .route("/users/is-blocked-by/:username", get(is_blocked_by))
         .route("/users/public-key/upload", post(upload_public_key))
+        .route("/users/storage", get(get_storage_info))
         .route("/files/upload", post(upload_file).layer(request_limit))
         .route("/files/pending", get(list_pending_files))
         .route("/files/sent", get(list_sent_files))
@@ -140,7 +148,6 @@ async fn main() {
         .layer(Extension(pool));
 
     println!("Dispatch server running on http://{}", addr);
-    println!("File upload limit: 10MB per request");
 
     let listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

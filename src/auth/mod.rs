@@ -1,9 +1,14 @@
 pub mod register;
 pub mod login;
 pub mod recovery;
-pub mod public_key;  // NEW
+pub mod public_key;
+pub mod recovery_phrase;
 
-//pub use register::*;
-//pub use login::*;
-//pub use recovery::*;
-//pub use public_key::*;  // NEW
+#[allow(unused_imports)]
+pub use register::register;
+#[allow(unused_imports)]
+pub use login::login;
+#[allow(unused_imports)]
+pub use recovery::recover_account;
+#[allow(unused_imports)]
+pub use public_key::upload_public_key;

@@ -30,6 +30,15 @@ pub struct UploadResponse {
     pub file_id: Option<Uuid>,
 }
 
+#[derive(Serialize)]
+pub struct StorageInfoResponse {
+    pub success: bool,
+    pub used_mb: i64,
+    pub limit_mb: i64,
+    pub available_mb: i64,
+    pub percentage_used: f64,
+}
+
 // Check if user A has blocked user B
 async fn is_blocked(pool: &PgPool, user_a_id: Uuid, user_b_id: Uuid) -> bool {
     let result = sqlx::query_scalar!(
@@ -41,6 +50,68 @@ async fn is_blocked(pool: &PgPool, user_a_id: Uuid, user_b_id: Uuid) -> bool {
     .await;
     
     result.unwrap_or(Some(false)).unwrap_or(false)
+}
+
+// Check storage quota before upload
+async fn check_storage_quota(
+    pool: &PgPool, 
+    user_id: Uuid, 
+    file_size_bytes: usize
+) -> Result<(i64, i64, i64), (StatusCode, Json<UploadResponse>)> {
+    let file_size_mb = (file_size_bytes / 1024 / 1024) as i64;
+    
+    let quota = sqlx::query!(
+        "SELECT storage_used_mb, storage_limit_mb FROM users WHERE id = $1",
+        user_id
+    )
+    .fetch_optional(pool)
+    .await;
+    
+    let quota = match quota {
+        Ok(Some(q)) => q,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(UploadResponse {
+                    success: false,
+                    message: "User not found".to_string(),
+                    file_id: None,
+                }),
+            ));
+        }
+        Err(e) => {
+            eprintln!("Quota check error: {}", e);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(UploadResponse {
+                    success: false,
+                    message: "Failed to check storage quota".to_string(),
+                    file_id: None,
+                }),
+            ));
+        }
+    };
+    
+    let used_mb = quota.storage_used_mb.unwrap_or(0);
+    let limit_mb = quota.storage_limit_mb.unwrap_or(1024);
+    let new_total_mb = used_mb + file_size_mb;
+    
+    if new_total_mb > limit_mb {
+        let error_msg = format!(
+            "Storage quota exceeded. Used: {} MB, Limit: {} MB, File size: {} MB. Upgrade your plan to upload more.",
+            used_mb, limit_mb, file_size_mb
+        );
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(UploadResponse {
+                success: false,
+                message: error_msg,
+                file_id: None,
+            }),
+        ));
+    }
+    
+    Ok((used_mb, limit_mb, file_size_mb))
 }
 
 // ============ UPLOAD FILE ============
@@ -60,6 +131,12 @@ pub async fn upload_file(
                 file_id: None,
             }),
         );
+    }
+    
+    // CHECK QUOTA BEFORE ANYTHING ELSE
+    match check_storage_quota(&pool, user_id, decoded_size).await {
+        Ok(_) => {}, // Quota check passed
+        Err((status, response)) => return (status, response),
     }
     
     // Find recipient
@@ -122,16 +199,16 @@ pub async fn upload_file(
     }
     
     // Validate encrypted_session_key is not a temp placeholder
-if payload.encrypted_session_key.is_empty() {
-    return (
-        StatusCode::BAD_REQUEST,
-        Json(UploadResponse {
-            success: false,
-            message: "Session key cannot be empty".to_string(),
-            file_id: None,
-        }),
-    );
-}
+    if payload.encrypted_session_key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(UploadResponse {
+                success: false,
+                message: "Session key cannot be empty".to_string(),
+                file_id: None,
+            }),
+        );
+    }
     
     let file_id = Uuid::new_v4();
     let file_path = format!("{}/{}.bin", STORAGE_PATH, file_id);
@@ -159,9 +236,32 @@ if payload.encrypted_session_key.is_empty() {
         let _ = fs::create_dir_all(parent).await;
     }
     
-    // Write file - use clone if needed, but we don't need file_data after this
-    if let Err(e) = fs::write(&file_path, &file_data).await {  // Use reference &file_data
+    // Write file with exclusive creation to prevent race conditions
+    let write_result = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)  // This prevents overwriting existing files
+        .open(&file_path)
+        .await;
+    
+    let mut file_handle = match write_result {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("File creation error: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(UploadResponse {
+                    success: false,
+                    message: format!("Failed to create file: {}", e),
+                    file_id: None,
+                }),
+            );
+        }
+    };
+    
+    use tokio::io::AsyncWriteExt;
+    if let Err(e) = file_handle.write_all(&file_data).await {
         eprintln!("Write error: {}", e);
+        let _ = fs::remove_file(&file_path).await;
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(UploadResponse {
@@ -178,6 +278,23 @@ if payload.encrypted_session_key.is_empty() {
     let expires_at_naive = expires_at.naive_utc();
     let pending_expires_at_naive = pending_expires_at.naive_utc();
     
+    // Start transaction for DB operations
+    let mut tx = match pool.begin().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Transaction start error: {}", e);
+            let _ = fs::remove_file(&file_path).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(UploadResponse {
+                    success: false,
+                    message: "Failed to start database transaction".to_string(),
+                    file_id: None,
+                }),
+            );
+        }
+    };
+    
     let result = sqlx::query!(
         "INSERT INTO files (id, sender_id, recipient_id, encrypted_file_path, encrypted_session_key, 
          encrypted_filename, file_size, custom_expiry_days, expires_at, pending_expires_at, status)
@@ -188,28 +305,69 @@ if payload.encrypted_session_key.is_empty() {
         file_path,
         payload.encrypted_session_key,
         payload.encrypted_filename,
-        file_size,  // Use the stored length
+        file_size,
         custom_days,
         expires_at_naive,
         pending_expires_at_naive
     )
-    .execute(&pool)
+    .execute(&mut *tx)
     .await;
     
     match result {
         Ok(_) => {
-            println!("File saved: {} from {} to {}", file_id, user_id, recipient_id);
-            (
-                StatusCode::OK,
-                Json(UploadResponse {
-                    success: true,
-                    message: "File uploaded successfully".to_string(),
-                    file_id: Some(file_id),
-                }),
+            // Update storage used
+            let file_size_mb = (file_size / 1024 / 1024) as i64;
+            let update_result = sqlx::query!(
+                "UPDATE users SET storage_used_mb = storage_used_mb + $1 WHERE id = $2",
+                file_size_mb,
+                user_id
             )
+            .execute(&mut *tx)
+            .await;
+            
+            if let Err(e) = update_result {
+                eprintln!("Storage update error: {}", e);
+                let _ = tx.rollback().await;
+                let _ = fs::remove_file(&file_path).await;
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(UploadResponse {
+                        success: false,
+                        message: "Failed to update storage quota".to_string(),
+                        file_id: None,
+                    }),
+                );
+            }
+            
+            match tx.commit().await {
+                Ok(_) => {
+                    println!("File saved: {} from {} to {}", file_id, user_id, recipient_id);
+                    (
+                        StatusCode::OK,
+                        Json(UploadResponse {
+                            success: true,
+                            message: "File uploaded successfully".to_string(),
+                            file_id: Some(file_id),
+                        }),
+                    )
+                }
+                Err(e) => {
+                    eprintln!("Commit error: {}", e);
+                    let _ = fs::remove_file(&file_path).await;
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(UploadResponse {
+                            success: false,
+                            message: "Failed to commit transaction".to_string(),
+                            file_id: None,
+                        }),
+                    )
+                }
+            }
         }
         Err(e) => {
             eprintln!("DB error: {}", e);
+            let _ = tx.rollback().await;
             let _ = fs::remove_file(&file_path).await;
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -217,6 +375,62 @@ if payload.encrypted_session_key.is_empty() {
                     success: false,
                     message: format!("Database error: {}", e),
                     file_id: None,
+                }),
+            )
+        }
+    }
+}
+
+// ============ GET STORAGE INFO ============
+pub async fn get_storage_info(
+    Extension(pool): Extension<PgPool>,
+    Extension(user_id): Extension<Uuid>,
+) -> (StatusCode, Json<StorageInfoResponse>) {
+    let result = sqlx::query!(
+        "SELECT storage_used_mb, storage_limit_mb FROM users WHERE id = $1",
+        user_id
+    )
+    .fetch_optional(&pool)
+    .await;
+    
+    match result {
+        Ok(Some(row)) => {
+            let used_mb = row.storage_used_mb.unwrap_or(0);
+            let limit_mb = row.storage_limit_mb.unwrap_or(1024);
+            let available_mb = limit_mb - used_mb;
+            let percentage_used = (used_mb as f64 / limit_mb as f64) * 100.0;
+            
+            (
+                StatusCode::OK,
+                Json(StorageInfoResponse {
+                    success: true,
+                    used_mb,
+                    limit_mb,
+                    available_mb,
+                    percentage_used,
+                }),
+            )
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(StorageInfoResponse {
+                success: false,
+                used_mb: 0,
+                limit_mb: 0,
+                available_mb: 0,
+                percentage_used: 0.0,
+            }),
+        ),
+        Err(e) => {
+            eprintln!("Storage info error: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(StorageInfoResponse {
+                    success: false,
+                    used_mb: 0,
+                    limit_mb: 0,
+                    available_mb: 0,
+                    percentage_used: 0.0,
                 }),
             )
         }
@@ -536,7 +750,7 @@ pub async fn download_file(
     Path(file_id): Path<Uuid>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let file = sqlx::query!(
-        "SELECT encrypted_file_path, encrypted_session_key, encrypted_filename
+        "SELECT encrypted_file_path, encrypted_session_key, encrypted_filename, expires_at
          FROM files
          WHERE id = $1 AND recipient_id = $2 AND status = 'accepted'",
         file_id, user_id
@@ -545,7 +759,17 @@ pub async fn download_file(
     .await;
     
     let file = match file {
-        Ok(Some(f)) => f,
+        Ok(Some(f)) => {
+            // Check if file has expired (expires_at is NOT NULL in schema)
+            let now = Utc::now().naive_utc();
+            if now > f.expires_at {
+                return (
+                    StatusCode::GONE,
+                    Json(serde_json::json!({ "success": false, "message": "File has expired" })),
+                );
+            }
+            f
+        },
         _ => {
             return (
                 StatusCode::NOT_FOUND,
@@ -593,7 +817,6 @@ pub async fn get_public_key_by_username(
     
     match user {
         Ok(Some(u)) => {
-            // FIXED: public_key is Option<String>, need to handle it properly
             match u.public_key {
                 Some(key) if !key.is_empty() => {
                     (

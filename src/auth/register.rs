@@ -2,8 +2,9 @@ use axum::{extract::Extension, http::StatusCode, response::Json, Json as AxumJso
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use bcrypt::{hash, DEFAULT_COST};
-use rand::{distributions::Alphanumeric, Rng};
 use uuid::Uuid;
+
+use super::recovery_phrase::generate_recovery_phrase;
 
 #[derive(Deserialize)]
 pub struct RegisterRequest {
@@ -116,12 +117,8 @@ pub async fn register(
         );
     }
     
-    // Generate 64-character recovery phrase
-    let recovery_phrase: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(64)
-        .map(char::from)
-        .collect();
+    // Generate cryptographically secure 24-word recovery phrase
+    let (recovery_phrase, _entropy) = generate_recovery_phrase();
     
     // Hash password and PIN
     let password_hash = match hash(&payload.password, DEFAULT_COST) {
@@ -175,14 +172,16 @@ pub async fn register(
     let user_id = Uuid::new_v4();
     
     let result = sqlx::query(
-        "INSERT INTO users (id, username, password_hash, pin_hash, recovery_phrase_hash) 
-         VALUES ($1, $2, $3, $4, $5)"
+        "INSERT INTO users (id, username, password_hash, pin_hash, recovery_phrase_hash, storage_used_mb, storage_limit_mb) 
+         VALUES ($1, $2, $3, $4, $5, $6, $7)"
     )
     .bind(user_id)
     .bind(&username)
     .bind(password_hash)
     .bind(pin_hash)
     .bind(recovery_hash)
+    .bind(0i64)  // storage_used_mb starts at 0
+    .bind(1024i64)  // storage_limit_mb = 1GB for free tier
     .execute(&pool)
     .await;
     
@@ -191,7 +190,7 @@ pub async fn register(
             StatusCode::CREATED,
             Json(RegisterResponse {
                 success: true,
-                message: "User registered. Save this recovery phrase!".to_string(),
+                message: "User registered. SAVE THESE 24 WORDS! They are your ONLY recovery method.".to_string(),
                 recovery_phrase: Some(recovery_phrase),
                 user_id: Some(user_id),
             }),
